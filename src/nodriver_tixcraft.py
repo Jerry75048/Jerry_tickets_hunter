@@ -927,6 +927,41 @@ async def nodriver_goto_homepage(driver, config_dict):
                 elif util.get_debug_mode(config_dict):
                     print(f"Verified {cookie_name} cookie: domain={sid_cookies[0].domain}, value length={len(sid_cookies[0].value)}")
 
+                # CRITICAL: Reload page to apply cookie (Issue #XXX)
+                # Without reload, browser still uses old unauthenticated state
+                if util.get_debug_mode(config_dict):
+                    print(f"[TIXCRAFT] Reloading page to apply {cookie_name} cookie...")
+                await tab.reload()
+                
+                # Wait for page to fully load after reload
+                max_wait = 15
+                check_interval = 0.5
+                max_attempts = int(max_wait / check_interval)
+                page_ready = False
+                
+                for attempt in range(max_attempts):
+                    try:
+                        ready_state = await tab.evaluate('document.readyState')
+                        ready_state = util.parse_nodriver_result(ready_state)
+                        
+                        if util.get_debug_mode(config_dict):
+                            print(f"[TIXCRAFT] Page readyState: {ready_state} (attempt {attempt + 1}/{max_attempts})")
+                        
+                        if ready_state == 'complete':
+                            page_ready = True
+                            break
+                        
+                        await asyncio.sleep(check_interval)
+                    except Exception as check_exc:
+                        await asyncio.sleep(check_interval)
+                
+                if util.get_debug_mode(config_dict):
+                    status = "ready" if page_ready else "timeout (continuing anyway)"
+                    print(f"[TIXCRAFT] Page {status} after cookie reload")
+                
+                # Additional wait to ensure DOM is fully rendered
+                await asyncio.sleep(random.uniform(1.0, 1.5))
+
             except Exception as e:
                 if util.get_debug_mode(config_dict):
                     print(f"Error setting TixCraft {cookie_name} cookie: {str(e)}")
@@ -952,6 +987,40 @@ async def nodriver_goto_homepage(driver, config_dict):
 
                 if util.get_debug_mode(config_dict):
                     print(f"tixcraft {cookie_name} cookie set successfully (fallback method)")
+
+                # CRITICAL: Reload page to apply cookie (fallback method) (Issue #XXX)
+                if util.get_debug_mode(config_dict):
+                    print(f"[TIXCRAFT] Reloading page to apply {cookie_name} cookie (fallback)...")
+                await tab.reload()
+                
+                # Wait for page to fully load after reload
+                max_wait = 15
+                check_interval = 0.5
+                max_attempts = int(max_wait / check_interval)
+                page_ready = False
+                
+                for attempt in range(max_attempts):
+                    try:
+                        ready_state = await tab.evaluate('document.readyState')
+                        ready_state = util.parse_nodriver_result(ready_state)
+                        
+                        if util.get_debug_mode(config_dict):
+                            print(f"[TIXCRAFT] Page readyState (fallback): {ready_state} (attempt {attempt + 1}/{max_attempts})")
+                        
+                        if ready_state == 'complete':
+                            page_ready = True
+                            break
+                        
+                        await asyncio.sleep(check_interval)
+                    except Exception as check_exc:
+                        await asyncio.sleep(check_interval)
+                
+                if util.get_debug_mode(config_dict):
+                    status = "ready" if page_ready else "timeout (continuing anyway)"
+                    print(f"[TIXCRAFT] Page {status} after cookie reload (fallback)")
+                
+                # Additional wait to ensure DOM is fully rendered
+                await asyncio.sleep(random.uniform(1.0, 1.5))
 
     if 'ibon.com' in homepage:
         # Special handling for tour.ibon.com.tw:
@@ -1040,6 +1109,24 @@ async def nodriver_goto_homepage(driver, config_dict):
             except Exception as e:
                 if util.get_debug_mode(config_dict):
                     print(f"[FUNONE] Error setting cookie: {str(e)}")
+
+    # Set window size early (before returning) to ensure consistent window size
+    # for both TIXUISID and non-TIXUISID flows
+    if len(config_dict["advanced"]["window_size"]) > 0:
+        if "," in config_dict["advanced"]["window_size"]:
+            try:
+                if tab:
+                    size_array = config_dict["advanced"]["window_size"].split(",")
+                    position_left = 0
+                    if len(size_array) >= 3:
+                        position_left = int(size_array[0]) * int(size_array[2])
+                    if util.get_debug_mode(config_dict):
+                        print(f"[WINDOW] Setting window size: {size_array[0]}x{size_array[1]}, position_left={position_left}")
+                    await tab.set_window_size(left=position_left, top=30, width=int(size_array[0]), height=int(size_array[1]))
+                    if util.get_debug_mode(config_dict):
+                        print(f"[WINDOW] Window size set successfully")
+            except Exception as window_exc:
+                print(f"[WINDOW] Warning: Failed to set window size: {window_exc}")
 
     return tab
 
@@ -20737,20 +20824,69 @@ def nodriver_overwrite_prefs(conf):
     with open(state_filepath, 'w') as outfile:
         outfile.write(json_str)
 
+def parse_refresh_datetime_target(target_time, now):
+    if target_time is None:
+        return None
+
+    target_time = str(target_time).strip()
+    if len(target_time) == 0:
+        return None
+
+    try:
+        return datetime.strptime(target_time, '%Y/%m/%d %H:%M:%S')
+    except Exception:
+        pass
+
+    try:
+        target_clock = datetime.strptime(target_time, '%H:%M:%S').time()
+        return datetime.combine(now.date(), target_clock)
+    except Exception:
+        return "INVALID"
+
+
 async def check_refresh_datetime_occur(tab, target_time):
-    is_refresh_datetime_sent = False
+    # Gate mode:
+    # - Empty target => start immediately (no gate)
+    # - Future target => keep waiting and block ticket flow
+    # - Reach/past target => release gate once and optionally refresh once
+    now = datetime.now()
 
-    system_clock_data = datetime.now()
-    current_time = system_clock_data.strftime('%H:%M:%S')
-    if target_time == current_time:
-        try:
-            await tab.reload()
-            is_refresh_datetime_sent = True
-            print("send refresh at time:", current_time)
-        except Exception as exc:
-            pass
+    if not hasattr(check_refresh_datetime_occur, "_last_wait_second"):
+        check_refresh_datetime_occur._last_wait_second = None
+    if not hasattr(check_refresh_datetime_occur, "_invalid_format_warned"):
+        check_refresh_datetime_occur._invalid_format_warned = False
 
-    return is_refresh_datetime_sent
+    target_dt = parse_refresh_datetime_target(target_time, now)
+
+    if target_dt is None:
+        return True
+
+    if target_dt == "INVALID":
+        if not check_refresh_datetime_occur._invalid_format_warned:
+            print("[REFRESH DATETIME] Invalid format. Use HH:MM:SS or YYYY/MM/DD HH:MM:SS. Start immediately.")
+            check_refresh_datetime_occur._invalid_format_warned = True
+        return True
+
+    if now < target_dt:
+        remaining_seconds = int((target_dt - now).total_seconds())
+        if remaining_seconds < 0:
+            remaining_seconds = 0
+
+        # Print wait status at most once per second to avoid flooding logs.
+        if check_refresh_datetime_occur._last_wait_second != remaining_seconds:
+            check_refresh_datetime_occur._last_wait_second = remaining_seconds
+            print(f"[REFRESH DATETIME] Waiting until {target_dt.strftime('%Y/%m/%d %H:%M:%S')} (remaining: {remaining_seconds}s)")
+
+        return False
+
+    try:
+        await tab.reload()
+        print("send refresh at time:", now.strftime('%H:%M:%S'))
+    except Exception as exc:
+        # Even if reload fails, release gate to avoid deadlock at start time.
+        print(f"[REFRESH DATETIME] Warning: reload failed at trigger time: {exc}")
+
+    return True
 
 async def reload_config(config_dict, last_mtime):
     app_root = util.get_app_root()
@@ -26351,8 +26487,7 @@ async def main(args):
                 print("[ERROR] Homepage navigation failed. Cannot continue.")
                 sys.exit()
             tab = await nodrver_block_urls(tab, config_dict)
-            if not config_dict["advanced"]["headless"]:
-                await nodriver_resize_window(tab, config_dict)
+            # Window size is now set in nodriver_goto_homepage for consistency
         else:
             print("無法使用nodriver，程式無法繼續工作")
             sys.exit()
@@ -26432,6 +26567,10 @@ async def main(args):
 
         if not is_refresh_datetime_sent:
             is_refresh_datetime_sent = await check_refresh_datetime_occur(tab, config_dict["refresh_datetime"])
+            if not is_refresh_datetime_sent:
+                # Real gate mode: block all ticket logic until refresh_datetime is reached.
+                await asyncio.sleep(0.1)
+                continue
 
         is_maxbot_paused = await check_and_handle_pause(config_dict)
 

@@ -2076,26 +2076,20 @@ def launch_maxbot(script_name="nodriver_tixcraft", filename="", homepage="", kkt
             cmd = script_name + '.exe ' + ' '.join(cmd_argument)
         subprocess.Popen(cmd, shell=True, cwd=working_dir)
     else:
-        interpreter_binary = 'python'
-        interpreter_binary_alt = 'python3'
-        if platform.system() != 'Windows':
-            interpreter_binary = 'python3'
-            interpreter_binary_alt = 'python'
         print("execute in shell mode.")
-
+        
+        # Use the current Python interpreter from sys.executable to ensure
+        # the subprocess uses the same virtual environment and has all dependencies
+        interpreter_binary = sys.executable
+        
         try:
             print('try', interpreter_binary)
             cmd_array = [interpreter_binary, script_name + '.py'] + cmd_argument
             s=subprocess.Popen(cmd_array, cwd=working_dir)
         except Exception as exc:
-            print('try', interpreter_binary_alt)
-            try:
-                cmd_array = [interpreter_binary_alt, script_name + '.py'] + cmd_argument
-                s=subprocess.Popen(cmd_array, cwd=working_dir)
-            except Exception as exc:
-                msg=str(exc)
-                print("exeption:", msg)
-                pass
+            msg=str(exc)
+            print("exeption:", msg)
+            pass
 
 def parse_nodriver_result(result):
     """
